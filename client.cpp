@@ -6,10 +6,24 @@
 #include <unistd.h>
 #include <thread> // for creating threads
 #include <strings.h> // for bzero() function
+#include <unordered_map>
 #include <vector>
+#include <deque>
 #include <cstring>
 #include <fcntl.h> // for open() function
+#include <openssl/sha.h>
 using namespace std;
+
+// store the ip_port for connecting to the client
+string ip_port = "";
+// store the user_id the client is authenticated as
+string UID = "";
+
+string homepath = getenv("HOME");
+string path = getenv("PWD");
+
+unordered_map<string, vector<int>> chunk_list; // store(filename+group_id, chunk_bitmap)
+unordered_map<string, string> chunk_path; // store(filename+group_id, filepath)
 
 // int copy_file(string filename, string destination) {
 //   // copy a file from filename to dest
@@ -143,6 +157,158 @@ vector<string> parsecommand(string command) {
   return output;
 }
 
+string resolve_path (string dest) {
+  // Resolve the input path 
+
+  // Can later be made a global variable
+  // string homepath = getenv("HOME");
+  
+  if(dest[0] == '/') {
+    //already absolute, so no need to do anything
+    return dest;
+  }
+  else if(dest[0] == '~') {
+      dest.replace(0, 1, homepath);
+  }
+  else if(dest == "." || dest == "./") { //dest[0] == '.') {
+    // replace dest with current path
+    dest = path;
+  }
+  else if(dest[0] == '.' && dest[1] == '.') {
+    // dest starts with ".." so we give reduced current path
+    string reduced_path = path;
+    while(reduced_path.size() > 1 && reduced_path[reduced_path.size() - 1] != '/') {
+      // cout << new_path[new_path.size() - 1]<< endl; 
+      reduced_path.pop_back();
+    }
+    // pop the '/' found too 
+    if(reduced_path.size() > 1) { // to handle case when path is '/' only
+      reduced_path.pop_back();
+    }
+    
+    dest.replace(0, 2, reduced_path);
+  }
+  else if(dest[0] == '.' && dest[1] == '/') {
+    //dest starts with "./" so we replace it with current path
+    dest.replace(0, 1, path);
+    // cout << ">>" << dest << "<<" << endl;
+  }
+  else{
+    // the path begins with the filename directly 
+    // so we need to add the current path before 
+
+    string new_path = path;
+
+    // add the directory name to the absolute path 
+    new_path.push_back('/');
+    new_path.append(dest);
+
+    dest = new_path;
+  }
+
+  return dest;
+}
+
+void encrypt(string input, unsigned char* hash) {
+  //store the SHA1 of the input in the hash 
+  SHA1((unsigned char *)input.c_str(), input.size() - 1, hash);
+  return;
+}
+
+deque<string> get_SHA1(string filepath, int &err) {
+  cout << "Getting Chunkwise File SHA" << endl;
+
+  deque<string> output;
+
+  // get the actual path from the filepath
+  filepath = resolve_path(filepath);
+
+  char* sourcepath = NULL;
+  sourcepath = realpath(filepath.c_str(), sourcepath);
+  if(sourcepath == NULL) {
+    cout << "Incorrect filepath: " + filepath << endl;
+    err = 1;
+    return output;
+  }
+  cout << sourcepath << endl;
+ 
+  string filename = sourcepath;
+  cout << filename.find_last_of('/') << endl;
+  filename = filename.substr(filename.find_last_of('/') + 1);
+  cout << filename << endl;
+
+  // read the data from file in chunks
+  int sfd = open(string(sourcepath).c_str(), O_RDONLY);
+  
+  if(sfd == -1) {
+    cout << "Invalid source file" << endl;
+    err = 1;
+    return output;
+  }
+
+  int chunk_no = 1; //every file will have atleast 1 chunk
+
+  const int chunk_size = 524288; // 1024*512B = 524288B = 512KB 
+  char buf[chunk_size]; 
+  int offset = (chunk_no - 1) * 524288;
+  
+  // int rstatus = read(sfd, &buf, 8192);    
+  int rstatus = pread(sfd, &buf, chunk_size, offset);    
+
+  if(rstatus == 0) {
+    cout << "No data at this chunk number" << endl;
+    err = 1;
+    return output;
+  }
+  if(rstatus == -1) {
+    cout << "Unable to read into file" << endl;
+    err = 1;
+    return output;
+  }
+  cout << "Bytes read: " << rstatus << endl;
+
+  output.push_back(filename);
+
+  // find the SHA1 hash of the chunk
+  unsigned char hash[SHA_DIGEST_LENGTH]; // == 20
+  encrypt(string(buf), hash);
+
+  // append hash in output 
+  string str(hash, hash + SHA_DIGEST_LENGTH);
+  cout << str.size() << endl;
+  output.push_back(str);
+
+  while(rstatus == chunk_size) {
+    //update chunk_no and offset  
+    ++chunk_no;
+    offset = (chunk_no - 1) * 524288;
+
+    //read the next chunk
+    memset(buf, '\0', chunk_size);
+    rstatus = pread(sfd, &buf, chunk_size, offset);
+    cout << "Bytes read: " << rstatus << endl;
+    if(rstatus == 0) {
+      // no chunk left to read 
+      --chunk_no;
+      break;
+    }
+
+    // find the SHA1 hash of the chunk
+    unsigned char hash[SHA_DIGEST_LENGTH]; // == 20
+    encrypt(string(buf), hash);
+
+    // append hash in output 
+    string str(hash, hash + SHA_DIGEST_LENGTH);
+    cout << str.size() << endl;
+    output.push_back(str);
+  }
+
+  //add the chunk_no at the front of the output vector 
+  output.push_front(to_string(chunk_no));
+  
+  return output;
+}
+
 int read_file(string sourcepath, int chunk_no, string &response) {
   // read a file based on given offset for upto chunk_size bytes
   // chunk_no is 1-indexed
@@ -188,6 +354,60 @@ string process_query(string query) {
 
   // parse the query string
   vector<string> query_args = parsecommand(query);
+
+  string command = query_args[0];
+  
+  if(strcmp(command.c_str(), "chunk_list") == 0) {
+  
+    // return the chunk_bitmap for files you have
+    string group_id = query_args[1];
+    string filename = query_args[2];
+
+    string response;
+    //iterate the chunk_bitmap 
+    vector<int> chunk_bitmap = chunk_list[filename+"_"+group_id]; 
+    for(int i = 0; i < chunk_bitmap.size(); ++i) {
+      response += chunk_bitmap[i];
+    }
+
+    return response;
+  }
+  else if(strcmp(command.c_str(), "get_chunk") == 0) {
+  
+    // return the chunk_bitmap for files you have
+    string group_id = query_args[1];
+    string filename = query_args[2];
+    int chunk_no = stoi(query_args[3]);
+    
+    string response;
+    
+    // check if you have chunk 
+    int check = chunk_list[filename+"_"+group_id][chunk_no - 1]; 
+    if(check == 0) {
+      response = "Request chunk not available";
+      return response;
+    }
+
+    // return chunk data as response
+    // // hardcoded directory path
+    // string DIR_PATH = "/home/abhayk/Documents/IIITH/AOS_CourseWork/Assignments/A3/";
+    // 
+    // string sourcepath = DIR_PATH + '/' + filename;
+    
+    // get the filepath from chunk_path
+    string sourcepath = chunk_path[filename + "_" + group_id];
+
+    // call the read_file to read a chunk of the file and store the data in 
+    // the response string
+    int status = read_file(sourcepath, chunk_no, response);
+    
+    if(status == -1) {
+      response = "Read operation failed";
+    }
+
+    return response;
+  }
+
 
   if(query_args.size() != 2) {
     string response = "Insufficient or excess arguments";
@@ -315,9 +535,64 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
 
   while(true) {
     // cin >> input_msg;
+    cout << "> "; 
     getline(cin, input_msg);
 
+    string fpath, gid;
+
+    vector<string> input_args = parsecommand(input_msg);
+    cout << "Arg Count: " << input_args.size() << endl;
+
+    if(strcmp(input_args[0].c_str(), "login") != 0 && 
+       strcmp(input_args[0].c_str(), "create_user") != 0) {
+      // check if UID is set => auth is done or not 
+      if(UID.empty()) {
+        cout << "Please Login/Create User before using any other command" << endl;
+        continue;
+      }
+    }
+    if(strcmp(input_args[0].c_str(), "upload_file") == 0) {
+      // we need to also append the number of chunks 
+      // followed by the chunkwise SHA1 of the file
+      if(input_args.size() < 3) {
+        cout << "Missing arguments for upload_file command";
+      }
+
+      int err = 0;
+      deque<string> hashes = get_SHA1(input_args[1], err);
+
+      if(err == 1) {
+        // some error has occured, so we will not proceed further
+        // and redirect back to user input 
+        continue;
+      }
+
+      // we will now append this deque in the message that we send to server
+      for(int i = 0; i < hashes.size(); ++i) {
+        input_msg += " " + hashes[i];
+      }
+
+      // store filepath and group_id for later storage if command is valid
+      fpath = input_args[1];
+      gid = input_args[2];
+    }
+    else {
+      cout << "First arg: >" << input_args[0] << "<" << endl;
+    }
+
+    // append user_id implicitly 
+    // is user_id is NULL, append the ip_port implicitly 
+    if(UID.empty()) {
+      cout << "Adding IP:PORT" << endl;
+      input_msg += " " + ip_port;
+    }
+    else {
+      cout << "Adding UID" << endl;
+      input_msg += " " + UID;
+    }
+
     cout << "Message to send: " << input_msg << endl;
+      
 
     // send input message to the server
     e = send(client_sockfd, input_msg.c_str(), input_msg.size(), 0);
@@ -334,27 +609,77 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
 
     // read message from server
     // bzero(buffer, chunk_size); // DEPRECATED
-    memset(buffer, '\0', 524288);
+    memset(buffer, '\0', chunk_size);
     cout << "||" << buffer << "||" << endl;
     e = recv(client_sockfd, &buffer, chunk_size, 0);
     if(e == -1) {
       cout << "Error reading message from buffer" << endl;
     }
     else if(e == 0) {
-      cout << "Empty response from server" << endl;
+      cout << "Connection closed from Server [Empty response from server]" << endl;
       break;
     }
     else {
-      cout << "Output: " << buffer << endl; 
+      cout << "Output: >" << buffer << "<" << endl; 
       // we will process the response baseed on the input we sent
 
-      vector<string> input_args = parsecommand(input_msg);
+      if(strcmp(input_args[0].c_str(), "login") == 0) {
+        if(strcmp(buffer, "Logged in successfully") == 0) {
+          // logged in successfully so the user_id given as 
+          // input_args[1] was marked active so we will set our UID as the same 
+          cout << buffer << endl;
+          cout << "Updating UID" << endl;
+          UID = input_args[1];
+        }
+      }
 
-      if(strcmp(input_args[0].c_str(), "download_file") == 0) {
+      else if(strcmp(input_args[0].c_str(), "create_user") == 0) {
         // we check if we have received a valid response from server
-        if(strcmp(buffer, "Incorrect query") != 0) {
+        if(strcmp(buffer, "User created successfully. Logged in") == 0) {
+          // logged in successfully so the user_id given as 
+          // input_args[1] was marked active so we will set our UID as the same 
+          cout << buffer << endl;
+          cout << "Updating UID" << endl;
+          UID = input_args[1];
+        }
+      }
+      
+      else if(strcmp(input_args[0].c_str(), "upload_file") == 0) {
+        // we check if we have received a valid response from server
+        if(buffer[0] != '~') {
+          // command was valid so we can save fpath and gid 
+          cout << buffer << endl;
+          string fname = resolve_path(path);
+          chunk_path[fname+"_"+gid] = fpath;
+        }
+      }
+      
+      else if(strcmp(input_args[0].c_str(), "download_file") == 0) {
+        // we check if we have received a valid response from server 
+        if(buffer[0] != '~') {
           // we have received valid response, so we will call client_read_file 
           // to get the chunks of the data and write into the file
+        
+          vector<string> buffer_args = parsecommand(buffer); 
+          int idx = 0;
+          // extract the peers we can contact 
+          vector<string> peer_list;
+          int peer_count = stoi(buffer_args[idx]);
+          for(int i = 0; i < peer_count; ++i) {
+            ++idx;
+            peer_list.push_back(buffer_args[idx]);
+          }
+          ++idx;
+          // extract the chunkwise hash 
+          vector<string> hash_list;
+          int chunk_count = stoi(buffer_args[idx]);
+          for(int i = 0; i < chunk_count; ++i) {
+            ++idx;
+            hash_list.push_back(buffer_args[idx]);
+          }
+
+          // call each peer to get the chunks they have and 
+          // decide on the order by the piece selection algo
  
           // call thread to fetch a chunk of data
         }
@@ -362,10 +687,14 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
 
       else if(strcmp(input_args[0].c_str(), "list_groups") == 0 || 
           strcmp(input_args[0].c_str(), "list_files") == 0 || 
-          strcmp(input_args[0].c_str(), "list_request") == 0 || 
-          strcmp(input_args[0].c_str(), "show_downloads") == 0 ) {
+          strcmp(input_args[0].c_str(), "list_requests") == 0 || 
+          strcmp(input_args[0].c_str(), "show_downloads") == 0 || 
+          strcmp(input_args[0].c_str(), "create_group") == 0) {
         // we don't need to process it further as we will output
         // the response in both the cases 
+        cout << buffer << endl;
+      }
+      else {
         cout << buffer << endl;
       }
 
@@ -487,6 +816,9 @@ int main(int argc, char *argv[]) {
     return -1;
   }
   cout << idx << endl;
+
+  //update ip_port string
+  ip_port = input;
 
   string IP = input.substr(0,idx); // we get : at idx so we need length as idx 
 

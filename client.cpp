@@ -1,3 +1,6 @@
+#include <cerrno>
+#include <climits>
+#include <functional>
 #include <iostream>  
 #include <string> //for argument parsing
 #include <sys/socket.h> // for creating socket descriptor
@@ -7,11 +10,15 @@
 #include <thread> // for creating threads
 #include <strings.h> // for bzero() function
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <deque>
 #include <cstring>
 #include <fcntl.h> // for open() function
 #include <openssl/sha.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <unistd.h>
 using namespace std;
 
 // store the ip_port for connecting to the client
@@ -24,6 +31,7 @@ string path = getenv("PWD");
 
 unordered_map<string, vector<int>> chunk_list; // store(filename+group_id, chunk_bitmap)
 unordered_map<string, string> chunk_path; // store(filename+group_id, filepath)
+unordered_map<string, int> chunk_written; // store(filename+group_id, chunks written to file) can be used for % downloaded
 
 // int copy_file(string filename, string destination) {
 //   // copy a file from filename to dest
@@ -215,7 +223,8 @@ void encrypt(string input, unsigned char* hash) {
   return;
 }
 
-deque<string> get_SHA1(string filepath, int &err) {
+deque<string> get_SHA1(string filepath, int &err, string &fname, string &fpath) {
+  // return chunkwise SHA1 of the file and store the filename and resolved filepath in fname and fpath
   cout << "Getting Chunkwise File SHA" << endl;
 
   deque<string> output;
@@ -236,6 +245,8 @@ deque<string> get_SHA1(string filepath, int &err) {
   cout << filename.find_last_of('/') << endl;
   filename = filename.substr(filename.find_last_of('/') + 1);
   cout << filename << endl;
+  fname = filename;
+  fpath = sourcepath;
 
   // read the data from file in chunks
   int sfd = open(string(sourcepath).c_str(), O_RDONLY);
@@ -249,9 +260,10 @@ deque<string> get_SHA1(string filepath, int &err) {
   int chunk_no = 1; //every file will have atleast 1 chunk
 
   const int chunk_size = 524288; // 1024*512B = 524288B = 512KB 
-  char buf[chunk_size]; 
+  char buf[chunk_size] = {0}; 
   int offset = (chunk_no - 1) * 524288;
   
+  memset(buf, '\0', chunk_size);
   // int rstatus = read(sfd, &buf, 8192);    
   int rstatus = pread(sfd, &buf, chunk_size, offset);    
 
@@ -305,13 +317,16 @@ deque<string> get_SHA1(string filepath, int &err) {
 
   //add the chunk_no at the front of the output vector 
   output.push_front(to_string(chunk_no));
-  
+ 
+  //close the file descriptor
+  close(sfd);
   return output;
 }
 
 int read_file(string sourcepath, int chunk_no, string &response) {
   // read a file based on given offset for upto chunk_size bytes
   // chunk_no is 1-indexed
+  cout << "Reading file for getting chunk" << endl;
 
   // open() returns a file descriptor upon successful execution
   // we want to copy content from sourcepath, so we will 
@@ -338,10 +353,24 @@ int read_file(string sourcepath, int chunk_no, string &response) {
     cout << "Unable to read into file" << endl;
     return -1;
   }
+  cout << "Read " << rstatus << " bytes" << endl;
+
+  // response = buf will not work because we are reading files 
+  // that may have EOF char in them as some form of encoding. Thus
+  // it is imperative to explicitly store all the bytes transferred
+  // as the constructor picking the chars will stop on encountering EOF.
 
   // The file has been read upto the chunk size, so 
-  // we can now send it to the client 
-  response = buf;
+  // we can now send it to the client
+  string output;
+  for(int i =0 ; i < rstatus; ++i) {
+    output.push_back(buf[i]);
+  }
+  response = output;
+  cout << "Response stored " << response.size() << " bytes" << endl;
+
+  //close file descriptor 
+  close(sfd);
 
   return 0;
 }
@@ -358,14 +387,24 @@ string process_query(string query) {
   string command = query_args[0];
   
   if(strcmp(command.c_str(), "chunk_list") == 0) {
-  
+    cout << "Retrieving Chunks" << endl;
+
+    if(query_args.size() < 3) {
+      cout << "Insufficient arguments" << endl;
+      return "";
+    }
+
     // return the chunk_bitmap for files you have
     string group_id = query_args[1];
     string filename = query_args[2];
 
-    string response;
+    string response = "";
     //iterate the chunk_bitmap 
-    vector<int> chunk_bitmap = chunk_list[filename+"_"+group_id]; 
+    vector<int> chunk_bitmap = chunk_list[filename+"_"+group_id];
+    if(chunk_bitmap.empty()) {
+      response = "No chunk for given file";
+      return response;
+    }
     for(int i = 0; i < chunk_bitmap.size(); ++i) {
       response += chunk_bitmap[i];
     }
@@ -373,11 +412,12 @@ string process_query(string query) {
     return response;
   }
   else if(strcmp(command.c_str(), "get_chunk") == 0) {
+    cout << "Retrieving Chunk Data" << endl;
   
     // return the chunk_bitmap for files you have
     string group_id = query_args[1];
     string filename = query_args[2];
-    int chunk_no = stoi(query_args[3]);
+    int chunk_no = stoi(query_args[3]); //chunk_no reduced
     
     string response;
     
@@ -474,19 +514,440 @@ void handleClientQuery(int new_server_socket) {
     string response = process_query(buffer);
     cout << "Size: " << response.size() << endl;
     // send response to the client
-    e = send(new_server_socket, response.c_str(), response.size(), 0);
-    if(e == -1) {
-      cout << "Failed to send message" << endl;
+    // first send the size of the response  
+  
+    vector<string> query_args = parsecommand(string(buffer));
+
+    string command = query_args[0];
+    
+    if(strcmp(command.c_str(), "get_chunk") == 0) {
+      string size_msg = to_string(response.size());
+      e = send(new_server_socket, size_msg.c_str(), size_msg.size(), 0);
+      if(e == -1) {
+        cout << "Failed to send message" << endl;
+      }
+
+      // then send the response itself but in chunks of 16 KB 
+      int msg_size = 16384; //16 KB
+      string output; 
+      int idx = 0;
+      int byte_count = response.size();
+      while(byte_count > 0) {
+        // store upto 16KB in output and send it 
+        // until all the response string has been sent 
+        output = "";
+        for(int i = 0; i < msg_size && idx < response.size(); ++i ,++idx) {
+          output.push_back(response[idx]);
+        }
+        
+        e = send(new_server_socket, output.c_str(), output.size(), 0);
+        // e = send(new_server_socket, response.c_str(), response.size(), 0);
+        if(e == -1) {
+          cout << "Failed to send message" << endl;
+        }
+        else {
+          cout << e << " bytes sent from server" << endl; 
+        }
+        byte_count -= e;
+      }
+
     }
     else {
-      cout << "Message sent from server" << endl; 
+      // then send the response itself
+      e = send(new_server_socket, response.c_str(), response.size(), 0);
+      if(e == -1) {
+        cout << "Failed to send message" << endl;
+      }
     }
+
   }
 
   //close socket connection
   e = close(new_server_socket);
   if(e == -1) {
     cout << "Error in closing socket file descriptor" << endl;
+  }
+  else {
+    cout << "Connection to client closed" << endl;
+  }
+}
+
+bool fileExists(string path, string filename) {
+  //check if file already exists at the directory mentioned by path 
+  cout << "Checking if file in directory :" << path << endl;
+  //create a pointer to point to a directory stream
+  DIR *dirp;
+
+  // The path whose files you want to list is present as function arugment 
+  // string path cannot be used as opendir requires const char* as input 
+
+  // open a directory stream based on the argument given.
+  // The pointer will point to the first entry in the directory stream 
+  dirp = opendir(path.c_str());
+
+  // readdir() returns a pointer of type dirent so we will create a pointer for it 
+  dirent *dent;
+
+  // Keep printing the contents of the directory stream till 
+  // you reach the end of the directory stream 
+  while (dirp != NULL) {
+    errno = 0;
+
+    // get the file descriptor 
+    // we are getting this before readdir() as readdir() moves the 
+    // pointer forward, due to which we will lose the pointer here 
+    // int filedes = dirfd(dirp);
+
+    // readdir() function will return a pointer to the current position
+    // specified by the directory pointer and move the pointer at the 
+    // next entry in the directory stream 
+    dent = readdir(dirp);      
+
+    if(dent != NULL) {
+      if(strcmp(filename.c_str(), (dent -> d_name)) == 0) {
+        cout << dent -> d_name << endl;
+        return true;
+      }
+      // else {
+      //   cout << dent -> d_name << endl;
+      // }
+    }
+    else {
+      break;
+    }
+  }
+
+  cout << "Not found" << endl;
+
+  //close the directory stream 
+  closedir(dirp);
+
+  return false;
+}
+
+vector<int> getChunkInfo(string ip_port, string group_id, string filename) {
+  //get the chunk bitmap from a peer for file
+ 
+  int e = 0;
+  //extract IP:PORT from ip_port string 
+  int idx = ip_port.find(":");
+  if(idx == -1) {
+    cout << "Incorrect <IP>:<PORT> input" << endl;
+    return vector<int>();
+  }
+  string IP = ip_port.substr(0,idx); // we get : at idx so we need length as idx 
+
+  //get the client PORT number from the remaining string 
+  int PORT = stoi(ip_port.substr(idx + 1));
+  
+  //create a connection to the peer at IP:PORT 
+  int peer_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  // AF_INET for IPV4 and SOCK_STREAM for 2-way connection-based byte stream
+  // Generally only a single protocol for each family, which is specified with 0
+  if(peer_sockfd < 0) {
+    cout << "Error creating socket" << endl;
+    return vector<int>();
+  }
+
+  sockaddr_in serv_addr; 
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_port = htons(PORT); 
+
+  e = inet_pton(AF_INET, IP.c_str(), &serv_addr.sin_addr);
+  if(e <= 0) {
+    cout << "Error in IP address conversion" << endl;
+    return vector<int>();
+  }
+  
+  // We will now connect the client_sockfd with the address specified by serv_addr which contains 
+  // the server address (IP & PORT info). This does not create a new socket like accept 
+  e = connect(peer_sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+  if(e < 0) {
+    cout << "Error in creating connection" << endl;
+    return vector<int>();
+  } 
+  else {
+    cout << "Connection to peer created" << endl; 
+  }
+
+  // pass the message "chunk_list " followed by group_id and filename  
+  string input_msg = "chunk_list " + group_id + " " + filename;
+  cout << "Input Msg: " << input_msg << endl;
+  e = send(peer_sockfd, input_msg.c_str(), input_msg.size(), 0);
+  if(e < 0) {
+    cout << "Failed to send message" << endl;
+    return vector<int>();
+  }
+  else if(e == 0) {
+    cout << "Empty message sent to peer" << endl;
+  }
+  else {
+    cout << "Message sent to peer" << endl; 
+  }
+  
+  const int chunk_size = 524288; // 1024*512B = 524288B = 512KB 
+  char buffer[chunk_size]; 
+
+  // read the response from peer
+  memset(buffer, '\0', chunk_size);
+  cout << "||" << buffer << "||" << endl;
+  e = recv(peer_sockfd, &buffer, chunk_size, 0);
+  if(e == -1) {
+    cout << "Error reading message from buffer" << endl;
+  }
+  else if(e == 0) {
+    cout << "Connection closed from peer [Empty response from peer]" << endl;
+    return vector<int>();
+  }
+
+  // return the valid response as a vector
+  string response;
+  for(int i =0 ; i < e; ++i) {
+    response.push_back(buffer[i]);
+  }
+
+  cout << ">" << response << "<" << endl;
+
+  vector<int> output;
+  for(int i = 0; i < response.size(); ++i) {
+    output.push_back(response[i]);
+  }
+
+
+  // closing the connected socket
+  close(peer_sockfd);
+
+  return output;
+}
+
+// void writeChunk(vector<string> peer_list, string group_id, string filename, int chunk_no, string dest, int &thread_count) {
+void writeChunk(vector<string> peer_list, string group_id, string filename, int chunk_no, int &thread_count, int fd) {
+  //get the chunk data from a peer for file and write the chunk at the file in dest
+  cout << "Using thread " << thread_count << "to get chunk " << chunk_no << endl;
+
+  bool flag = false; 
+  for(int i = 0; i < peer_list.size() && flag == false; ++i) {
+    string ip_port = peer_list[i];
+  
+    int e = 0;
+    //extract IP:PORT from ip_port string 
+    int idx = ip_port.find(":");
+    if(idx == -1) {
+      cout << "Incorrect <IP>:<PORT> input" << endl;
+      // return -1;
+      return;
+    }
+    string IP = ip_port.substr(0,idx); // we get : at idx so we need length as idx 
+
+    //get the client PORT number from the remaining string 
+    int PORT = stoi(ip_port.substr(idx + 1));
+    
+    //create a connection to the peer at IP:PORT 
+    int peer_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    // AF_INET for IPV4 and SOCK_STREAM for 2-way connection-based byte stream
+    // Generally only a single protocol for each family, which is specified with 0
+    if(peer_sockfd < 0) {
+      cout << "Error creating socket" << endl;
+      // return -2;
+      return;
+    }
+
+    sockaddr_in serv_addr; 
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT); 
+
+    e = inet_pton(AF_INET, IP.c_str(), &serv_addr.sin_addr);
+    if(e <= 0) {
+      cout << "Error in IP address conversion" << endl;
+      // return -2;
+      return;
+    }
+    
+    // We will now connect the client_sockfd with the address specified by serv_addr which contains 
+    // the server address (IP & PORT info). This does not create a new socket like accept 
+    e = connect(peer_sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+    if(e < 0) {
+      cout << "Error in creating connection" << endl;
+      // return -2;
+      return;
+    } 
+    else {
+      cout << "Connection to peer created" << endl; 
+    }
+
+    // pass the message "chunk_list " followed by group_id and filename  
+    string input_msg = "get_chunk " + group_id + " " + filename + " " + to_string(chunk_no);
+    cout << "Input Msg: " << input_msg << endl;
+    e = send(peer_sockfd, input_msg.c_str(), input_msg.size(), 0);
+    if(e < 0) {
+      cout << "Failed to send message" << endl;
+      // return -3;
+      return;
+    }
+    else if(e == 0) {
+      cout << "Empty message sent to peer" << endl;
+    }
+    else {
+      cout << "Message sent to peer" << endl; 
+    }
+    
+    const int chunk_size = 524288; // 1024*512B = 524288B = 512KB 
+    char buffer[chunk_size]; 
+
+    // read the response from peer
+    memset(buffer, '\0', chunk_size);
+    cout << "||" << buffer << "||" << endl;
+    // e = read(peer_sockfd, &buffer, chunk_size);
+    e = recv(peer_sockfd, &buffer, chunk_size, 0);
+    if(e == -1) {
+      cout << "Error reading message from buffer" << endl;
+      // return -3;
+      return;
+    }
+    else if(e == 0) {
+      cout << "Connection closed from peer [Empty response from peer]" << endl;
+      // return -3;
+      return;
+    }
+    
+    string response;
+
+    int data_left = stoi(string(buffer));
+    cout << "Data to receive: " << data_left << " bytes" << endl;
+    // store the data recieved in buffer
+    while(data_left > 0) {
+      memset(buffer, '\0', chunk_size);
+      e = read(peer_sockfd, &buffer, chunk_size);
+      // e = recv(peer_sockfd, &buffer, chunk_size, 0);
+      if(e == -1) {
+        cout << "Error reading message from buffer" << endl;
+        // return -3;
+        return;
+      }
+      else if(e == 0) {
+        cout << "Connection closed from peer [Empty response from peer]" << endl;
+        // return -3;
+        return;
+      }
+      cout << "Got " << e << " bytes for chunk " << chunk_no << endl;
+   
+      // store the message received from buffer into the string 
+      for(int i = 0; i < e; ++i) {
+      response.push_back(buffer[i]);
+      }
+
+      data_left -= e;
+      cout << "Data Left: " << data_left << " for chunk " << chunk_no << endl;
+    }
+
+    // cout << e << " bytes read" << endl;
+    cout << ">" << response.size() << "< bytes stored in response" << endl;
+
+    // TODO: check if the buffer_data is non-corrupted or not
+    flag = true;
+
+    // closing the connected socket
+    close(peer_sockfd);
+   
+    // if buffer_data is corrupted, we call continue here and not 
+    // open the file for writing 
+
+    //create the file if it doesn't exist at dest  
+    // string destpath = resolve_path(dest);
+    // append filename to destpath
+    // destpath.push_back('/');
+    // destpath.append(filename);
+    // cout << "Destination: " << destpath << endl;
+    
+    // int fd = open(destpath.c_str(),  O_CREAT | O_WRONLY | 00777);
+    // if(fd == -1) {
+    //   cout << "Unable to open/create file" << endl;
+    //   // return -1;
+    //   return;
+    // }
+    // else {
+    //   cout << "Opened/Created file" << endl;
+    // }
+
+    //write the response into the file 
+
+    // set the offset based on the chunk_no   
+    int offset = (chunk_no - 1) * chunk_size;
+                                  
+    // write into the file pointed to by file descriptor fd
+    // int wstatus = write(fd, &buf, count);
+    int wstatus;
+
+    wstatus = pwrite(fd, response.c_str(), response.size(), offset);
+
+    if(wstatus == -1) {
+      cout << "Unable to write into file" << endl;
+      if(errno == EAGAIN) {
+        cout << "EAGAIN";
+      }
+      else if(errno == EBADF) {
+        cout << "EBADF";
+      }
+      else if(errno == EFAULT) {
+        cout << "EFAULT";
+      }
+      else if(errno == EINTR) {
+        cout << "EINTR";
+      }
+      else if(errno == EINVAL) {
+        cout << "EINVAL";
+      }
+      else if(errno == EFBIG) {
+        cout << "EFBIG";
+      }
+      else if(errno == ENOSPC) {
+        cout << "ENOSPC";
+      }
+      else if(errno == EPERM) {
+        cout << "EPERM";
+      }
+      else if(errno == EPIPE) {
+        cout << "EPIPE";
+      }
+      else {
+        cout << "Some error" << endl;
+      }
+      // return -1;
+      return;
+    }
+    
+    // int bytes_written = 0;
+    // while (bytes_written != chunk_data.size()) {
+    //   wstatus = pwrite(fd, chunk_data.c_str(), chunk_size, offset);
+    //
+    //   if(wstatus == -1) {
+    //     cout << "Unable to write into file" << endl;
+    //     return -1;
+    //   }
+    //
+    //   bytes_written += wstatus; 
+    // }
+
+    // cout << "Written chunk " << chunk_no << " into file at " << destpath << endl;
+    cout << "Written chunk " << chunk_no << " of " << wstatus << " bytes at offset " << offset << endl;
+
+    // update the chunk_bitmap
+    chunk_list[filename+"_"+group_id][chunk_no] = 1;
+    
+    // close file descriptor for destination file
+    // e = close(fd);
+    // if(e == -1) {
+    //   cout << "Error while closing destination file" << endl;
+    // }
+
+    // set done as true 
+    // done = true;
+
+    // increment chunk_written count 
+    ++chunk_written[filename+"_"+group_id];
+
+    //decrement thread_count 
+    // --thread_count;
   }
 }
 
@@ -538,7 +999,12 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
     cout << "> "; 
     getline(cin, input_msg);
 
-    string fpath, gid;
+    string fpath, gid, dest, fname;
+    int chunk_no = -1; 
+
+    if(input_msg.empty()) {
+      continue;
+    }
 
     vector<string> input_args = parsecommand(input_msg);
     cout << "Arg Count: " << input_args.size() << endl;
@@ -559,23 +1025,57 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
       }
 
       int err = 0;
-      deque<string> hashes = get_SHA1(input_args[1], err);
+      deque<string> hashes = get_SHA1(input_args[1], err, fname, fpath);
 
       if(err == 1) {
         // some error has occured, so we will not proceed further
-        // and redirect back to user input 
+        // and redirect back to user input
+        cout << "Error occured" << endl;
         continue;
       }
+ 
+      // we will append the user_id before appending the hashes 
+      input_msg += " " + UID;
 
+      chunk_no = stoi(hashes[0]); 
       // we will now append this deque in the message that we send to server
       for(int i = 0; i < hashes.size(); ++i) {
         input_msg += " " + hashes[i];
       }
 
-      // store filepath and group_id for later storage if command is valid
-      fpath = input_args[1];
+      // store group_id for later storage if command is valid
       gid = input_args[2];
     }
+    else if(strcmp(input_args[0].c_str(), "download_file") == 0) {
+      
+      if(input_args.size() < 4) {
+        cout << "Missing arguments for download_file command" << endl;
+        continue;
+      }
+      
+      // store filepath and group_id for later storage if command is valid
+      gid = input_args[1];
+      fpath = input_args[2];
+      dest = input_args[3];
+
+      // extract filename 
+      string sourcepath = resolve_path(fpath);
+      int idx = sourcepath.find_last_of('/');
+      if(idx != string::npos) {
+        // some path in the filename input
+        //filename = filename.substr(0, idx);
+        fname = sourcepath.substr(idx+1, sourcepath.size());
+      }
+
+      cout << "Filename: " << fname << endl;
+
+      if(fileExists(resolve_path(dest), fname) == true) {
+        cout << "File already exists at destination path" << endl;
+        continue;
+      }
+
+    }
+
     else {
       cout << "First arg: >" << input_args[0] << "<" << endl;
     }
@@ -587,8 +1087,10 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
       input_msg += " " + ip_port;
     }
     else {
-      cout << "Adding UID" << endl;
-      input_msg += " " + UID;
+      if(strcmp(input_args[0].c_str(), "upload_file") != 0) {
+        cout << "Adding UID" << endl;
+        input_msg += " " + UID; 
+      }
     }
 
     cout << "Message to send: " << input_msg << endl;
@@ -649,8 +1151,9 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
         if(buffer[0] != '~') {
           // command was valid so we can save fpath and gid 
           cout << buffer << endl;
-          string fname = resolve_path(path);
+          cout << "Storing at " << fname << "_" << gid << endl;
           chunk_path[fname+"_"+gid] = fpath;
+          chunk_list[fname+"_"+gid] = vector<int>(chunk_no, 1);
         }
       }
       
@@ -665,6 +1168,7 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
           // extract the peers we can contact 
           vector<string> peer_list;
           int peer_count = stoi(buffer_args[idx]);
+          cout << "No. of peers: " << peer_count << endl;
           for(int i = 0; i < peer_count; ++i) {
             ++idx;
             peer_list.push_back(buffer_args[idx]);
@@ -673,16 +1177,164 @@ void connectToTrackerServer(int server_PORT, string server_IP) {
           // extract the chunkwise hash 
           vector<string> hash_list;
           int chunk_count = stoi(buffer_args[idx]);
+          cout << "No. of chunks: " << chunk_count << endl;
           for(int i = 0; i < chunk_count; ++i) {
             ++idx;
             hash_list.push_back(buffer_args[idx]);
           }
 
-          // call each peer to get the chunks they have and 
-          // decide on the order by the piece selection algo
- 
+          cout << "Peer List: " << endl;
+          for(int i = 0; i < peer_list.size(); ++i) {
+            cout << peer_list[i] << endl;
+          }
+          
+          cout << "ChunkWise Hash: " << endl;
+          for(int i = 0; i < hash_list.size(); ++i) {
+            cout << hash_list[i] << endl;
+          }
+
+          dest = resolve_path(dest);
+          cout << "Destination Path: " << dest << endl;
+
+          cout << "Group Id: " << gid << endl;
+          cout << "Filename: " << fname << endl;
+
+          // call each peer to get the chunks they have 
+          // (no need for threads as we can connect with each 
+          // peer in turn, get the info and disconnect)
+
+          vector<int> peers; //store the indices of the peers that responded 
+          vector<vector<int>> bitmaps; //store the chunk_bitmaps of the peers 
+          
+          //store the chunk_no along with peers who have them in an unordered_map 
+          unordered_map<int, vector<string> > chunk_map;
+
+          chunk_count = -1; 
+      
+          for(int i = 0; i < peer_list.size(); ++i) {
+            string ip_port;
+            vector<int> bitmap = getChunkInfo(peer_list[i], gid, fname);
+            if(bitmap.empty()) {
+              cout << "Error in contacting peer" << endl;
+            }
+            else {
+              chunk_count = bitmap.size();
+              for(int j = 0; j < chunk_count; ++j) {
+                if(bitmap[j] == 1) {
+                  chunk_map[j+1].push_back(peer_list[i]);
+                }
+              }
+              bitmaps.push_back(bitmap);
+            }
+          }
+
+          //for display purpAOS_Assignment3.pdfoses 
+          cout << "No. of chunks" << chunk_count << endl;
+          cout << "BitMaps: " << endl;
+          for(int i = 0; i < bitmaps.size(); ++i) {
+            for(int j = 0; j < chunk_count; ++j) {
+              cout << bitmaps[i][j];
+            }
+            cout << endl;
+          }
+        
+          // for display purposes 
+          if(chunk_map.empty()) {
+            cout << "Chunk Map is empty" << endl;
+          }
+          for(auto idx = chunk_map.begin(); idx != chunk_map.end(); ++idx) {
+            cout << idx -> first << ": ";
+            for(int j = 0; j < idx -> second.size(); ++j) {
+              cout << (idx -> second)[j] << " ";
+            }
+            cout << endl;
+          }
+
+          // piece selection algo will now only contact the peers it received the bitmap from
+          // and will create a thread for each chunk. The chunk will be selected randomly and
+          // the valid peer to contact for that chunk will also be selected randomly
+          
+          // download the file at location pointed by dest
+        
+          // make an entry for the file in chunk_list for bitmap
+          chunk_list[fname+"_"+gid] = vector<int>(chunk_count, 0);
+          // make an entry for the file in chunk_written for count 
+          chunk_written[fname+"_"+gid] = 0;
+
+          // open file descriptor for output file at dest
+          string destpath = resolve_path(dest);
+          // append filename to destpath
+          destpath.push_back('/');
+          destpath.append(fname);
+          cout << "Destination: " << destpath << endl;
+
+          int fd = creat(destpath.c_str(),  S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+            // open(destpath.c_str(),  O_CREAT | O_WRONLY | 00777);
+          if(fd == -1) {
+            cout << "Unable to open/create file" << endl;
+            // return -1;
+            return;
+          }
+          else {
+            cout << "Opened/Created file" << endl;
+          }
+
+
+          int thread_count = 0;
           // call thread to fetch a chunk of data
+          vector<int> peer(chunk_map.size());
+          for(auto idx = chunk_map.begin(); idx != chunk_map.end(); ++idx) {
+            while(thread_count > 1) {
+              cout << "Processing ..." << endl;
+              sleep(1);
+            }
+
+            int chunk_no = (idx -> first); // the number will be correct to index by the read_file code
+     
+            //traverse the peer_list and write the chunk_data received from peer
+            // thread t(writeChunk, idx -> second, gid, fname, chunk_no, ref(thread_count), fd);
+            // // thread t(writeChunk, idx -> second, gid, fname, chunk_no, dest, ref(thread_count));
+            // // thread th(writeChunk, idx -> second, gid, fname, chunk_no, dest, chunk_bitmap, thread_count, chunk_written);
+            // t.detach();             
+            // ++thread_count;
+            writeChunk(idx -> second, gid, fname, chunk_no, thread_count, fd);
+            if(chunk_written[fname+"_"+gid] >= 1) {
+              // TODO: contact the tracker to tell that we have some chunk of the file 
+            }
+            // if(done == true) {
+            //   break;
+            // }
+            
+            // for(int j = 0; j < idx -> second.size(); ++j) {
+            //   string ip_port = (idx -> second)[j];
+            //   while(thread_count > 1) {
+            //     // sleep for 1 second 
+            //     sleep(1);
+            //   }
+            //   thread t(writeChunk, idx -> second, gid, fname, chunk_no, dest, chunk_bitmap, done, thread_count);
+            //   t.detach();             
+            //   ++thread_count;
+            //   if(done == true) {
+            //     ++chunk_written;
+            //     if(chunk_written == 1) {
+            //       // TODO: contact the tracker to tell that we have some chunk of the file 
+            //
+            //     }
+            //     chunk_bitmap[chunk_no] = 1;
+            //     break;
+            //   }
+            // }
+            // cout << endl;
+          }
+          while(thread_count > 0) {
+            cout << "[ " << chunk_map.size() << "/" << chunk_written[fname+"_"+gid] << " ] downloaded"<< endl;
+            cout << "Threads pending: " << thread_count << endl;
+            sleep(1);
+          }
+          //close file descriptor
+          close(fd);
         }
+
       }
 
       else if(strcmp(input_args[0].c_str(), "list_groups") == 0 || 
@@ -775,7 +1427,7 @@ void connectToServer(int server_PORT, string server_IP) {
   }
 
   // bzero(buffer, chunk_size); // DEPRECATED
-  memset(buffer, '0', 524288);
+  memset(buffer, '\0', chunk_size);
   e = read(client_sockfd, &buffer, chunk_size);
   if(e == -1) {
     cout << "Error reading message from buffer" << endl;

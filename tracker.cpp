@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <iostream>  
 #include <string> //for argument parsing
 #include <sys/socket.h> // for creating socket descriptor
@@ -133,7 +134,6 @@ void remove_active(string user_id) {
   // remove user_id, ip_port pair from the active_users map
   active_users.erase(user_id);
 }
-
 
 int store_cred(string user_id, string pass) {
   //check if userid already exists in user_profiles 
@@ -278,6 +278,8 @@ int accept_request(string group_id, string request_user_id, string user_id) {
 
 int upload_file(string sourcepath, string filename, string group_id, string user_id, vector<string> hashes) {
   //check if user_id is a member of group
+  cout << "Group Id: " << group_id << endl;
+  cout << "User Id: " << user_id << endl;
   if(group_mbrs[group_id].find(user_id) == group_mbrs[group_id].end()) {
     // user_id is not present in the group_mbrs set 
     return -1; 
@@ -309,10 +311,21 @@ string list_files(string group_id) {
 }
 
 int download_file(string group_id, string user_id, string filename, string &response) {
+  // store the list of IP:PORT of peers and the chunkwise SHA1 hash for a given file in response string
+
   // check if user_id is member of group 
   if(group_mbrs[group_id].find(user_id) == group_mbrs[group_id].end()) {
     // user_id is not present in the group_mbrs set 
     return -1; 
+  }
+  
+  // extract filename 
+  string sourcepath = resolve_path(filename);
+  int idx = sourcepath.find_last_of('/');
+  if(idx != string::npos) {
+    // some path in the filename input
+    //filename = filename.substr(0, idx);
+    filename = sourcepath.substr(idx+1, sourcepath.size());
   }
 
   // check if file is in group 
@@ -330,9 +343,9 @@ int download_file(string group_id, string user_id, string filename, string &resp
   for(auto idx = user_id_list.begin(); idx != user_id_list.end(); ++idx) {
     // check if the user_id is in the active_users list 
     if(active_users.find(user_id) != active_users.end())  {
-      // an active user
+      // an active user so we append the IP:PORT for contact
       ++count;
-      uid_str += (" " + *idx);
+      uid_str += (" " + active_users[*idx]);
     }
   }
   if(count == 0) {
@@ -581,15 +594,18 @@ string process_query(string query) {
     
     string filepath = query_args[1];
     string group_id = query_args[2];
-    int chunk_no = stoi(query_args[3]);
-    string filename = query_args[4];
+    string user_id = query_args[3]; // this will be implicitly sent by the client
+    int chunk_no = stoi(query_args[4]);
+    string filename = query_args[5];
+    
     //store the hash for each chunk in a vector
     vector<string> hashes;
     int i;
     for(i = 0; i < chunk_no; ++i) {
-      hashes.push_back(query_args[4+i+1]);
+      cout << "Hash length: " << query_args[5+i+1].size() << endl; 
+      hashes.push_back(query_args[5+i+1]);
     }
-    string user_id = query_args[4+i+1]; // this will be implicitly sent by the client
+    // string user_id = query_args[4+i+1]; // this will be implicitly sent by the client
      
     // upload the file metadata and related information
     // in the tracker
@@ -606,7 +622,7 @@ string process_query(string query) {
   else if(strcmp(command.c_str(), "download_file") == 0) {
 
     if(query_args.size() < 5) {
-      response = "Missing argument for download_file command";
+      response = "~Missing argument for download_file command";
       return response;
     }
     
@@ -615,7 +631,6 @@ string process_query(string query) {
     string dest_path = query_args[3]; // will not be used by tracker but by client itself 
     string user_id = query_args[4]; // this will be implicitly sent by the client
    
-
     int status = download_file(group_id, user_id, filename, response);
     if(status == -1) {
       response = "~You are not member of group " + group_id;
@@ -782,8 +797,9 @@ int main(int argc, char *argv[]) {
   int e; // for storing status to check if any error has occured 
 
   string TRACKER_FILENAME = argv[1];
+  int TRACKER_NO;
   try {
-    int TRACKER_NO = stoi(argv[2]);
+    TRACKER_NO = stoi(argv[2]);
   } 
   catch (...) {
     cout << "Tracker number is NaN" << endl;
@@ -793,10 +809,37 @@ int main(int argc, char *argv[]) {
   // extract IP address and PORT number from arguments
   // by reading the IP:PORT associated with the input tracker number 
   // TODO: Write code to parse the tracker_info.txt file
+  
+  string sourcepath = resolve_path(TRACKER_FILENAME);
+  int tfd = open(sourcepath.c_str(), O_RDONLY);
+  
+  if(tfd == -1) {
+    cout << "Invalid source file" << endl;
+    return -1;
+  }
+  
+  char buf[128] = {0}; 
+  int offset = (TRACKER_NO - 1) * 15;
+  
+  memset(buf, '\0', 128);
+  // read 14 chars from the tracker_info.txt file
+  int rstatus = pread(tfd, &buf, 14, offset);    
+  cout << "Bytes read: " << rstatus << endl;
 
-  string IP = "127.0.0.1"; //hardcoded  
+  string ip_port = buf;
+  int idx = ip_port.find(":");
+  if(idx == -1) {
+    cout << "Incorrect <IP>:<PORT> input" << endl;
+    return -1;
+  }
+  string IP = ip_port.substr(0,idx); 
 
-  int PORT = stoi("8000"); //hardcoded 
+  int PORT = stoi(ip_port.substr(idx + 1));
+
+
+  // string IP = "127.0.0.1"; //hardcoded  
+  //
+  // int PORT = stoi("8000"); //hardcoded 
  
   cout << "IP: " << IP << endl;
   cout << "PORT: " << PORT << endl;
@@ -938,14 +981,15 @@ int main(int argc, char *argv[]) {
   // To contact with the tracker itself, we will be given IP:PORT of the tracker 
   // from the tracker_info.txt file from the arguments.   
 
-  // TODO: extract tracker server port from the file and store in server_PORT 
-  int server_PORT = stoi(TRACKER_FILENAME); //this port is that of the server that we will connect into
-  cout << "server PORT: " << server_PORT << endl;
-  string server_IP = "127.0.0.1"; //hardcoded [will need to extract from tracker_info.txt file] 
- 
-  // call the connectToServer function as a thread to connect to server
-  thread t(connectToServer, server_PORT, server_IP);
-  t.detach();
+  // TODO: extract tracker server port from the file and store in server_PORT
+  // TODO: connect to a master tracker OR write data structures into a file  
+ //  int server_PORT = stoi(TRACKER_FILENAME); //this port is that of the server that we will connect into
+ //  cout << "server PORT: " << server_PORT << endl;
+ //  string server_IP = "127.0.0.1"; //hardcoded [will need to extract from tracker_info.txt file] 
+ // 
+ //  // call the connectToServer function as a thread to connect to server
+ //  thread t(connectToServer, server_PORT, server_IP);
+ //  t.detach();
 
   // accept a connection request on a socket. The newly created socket
   // is not in the listening state and the original socket file descriptor 
